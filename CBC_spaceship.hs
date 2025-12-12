@@ -166,7 +166,7 @@ mixedReactorShip =
         s3 = addReactor antimatter s2   -- Has Fusion AND Antimatter (Slots: 6)
         s4 = addEngine s3
         s5 = addLifeSupport s4
-        s6 = addBridge s5               -- Slots: 11 (Opps, quá slot -> Lỗi B-307 nếu compile).
+        -- s6 = addBridge s5               -- Slots: 11 (Opps, quá slot -> Lỗi B-307 nếu compile).
                                         -- Giả sử ta bỏ bớt addReactor thứ 2 để đủ slot test logic Shield:
     in s1 
     

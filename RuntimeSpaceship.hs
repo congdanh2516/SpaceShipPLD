@@ -1,9 +1,16 @@
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings #-}
+
 module Runtime where
 
 -- Standard libraries
-import Data.List (sortOn, intercalate, isPrefixOf, isInfixOf)
 import System.IO (isEOF, hSetBuffering, stdout, BufferMode(NoBuffering))
+import Data.Ord (Down(Down))
+import Data.Maybe (fromMaybe)
+import qualified Data.ByteString.Lazy.Char8 as BL
+import Data.Aeson (eitherDecode)
+import Data.Aeson.Types (parseEither)
+import Data.List (isPrefixOf, isInfixOf, sortOn, intercalate)
 
 -- ==========================
 -- 1. DATA TYPES
@@ -87,12 +94,15 @@ initial_state (ShipBlueprint _ blueprintComps) =
 
 tick' :: SpaceshipState -> String -> (SpaceshipState, String, String)
 tick' state jsonEvents =
-  let events = parseEvents jsonEvents
-      (newState, logs, alerts) = runSimulationLogic state events
-  in ( newState
-     , encodeStringList logs
-     , encodeStringList alerts
-     )
+  case alive state of
+    False -> (state, encodeStringList [], encodeStringList []) -- once destroyed, no further changes/logs
+    True ->
+      let events = parseEvents jsonEvents
+          (newState, logs, alerts) = runSimulationLogic state events
+      in ( newState
+         , encodeStringList logs
+         , encodeStringList alerts
+         )
 
 -- ==========================
 -- 4. STATE SERIALIZATION
@@ -103,33 +113,33 @@ state_to_string SpaceshipState{..} =
   let numReactors = length [() | c@Component{cType=Reactor} <- components]
       totalOut = numReactors * 1000
       totalDraw = sum [ drawForSnapshot c coolerActive | c <- components ]
-      
+
       findComp p = filter p components
-      
+
       lifeStatus = case findComp (isLifeSupport . cType) of
                      (c:_) -> lifeSupportStatusToJson (cStatus c)
                      []    -> "\"UNAVAILABLE\""
-      
+
       coolerStatus = if any (isLifeSupport . cType) components
                      then if coolerActive then "\"ACTIVE\"" else "\"INACTIVE\""
                      else "\"UNAVAILABLE\""
-      
+
       engineStatus = case findComp (isEngine . cType) of
                        (c:_) -> engineStatusToJson c
                        []    -> "\"UNAVAILABLE\""
-      
+
       bridgeStatus = case findComp (isBridge . cType) of
                        (c:_) -> compStatusToJson c
                        []    -> "\"UNAVAILABLE\""
-      
+
       shieldStatus = case findComp (isShield . cType) of
                        (c:_) -> shieldStatusToJson c
                        []    -> "\"UNAVAILABLE\""
-      
+
       sensorsStatus = case findComp (isSensors . cType) of
                         (c:_) -> compStatusToJson c
                         []    -> "\"UNAVAILABLE\""
-      
+
       heatInt = round totalHeat
   in "{\n" ++
      "  \"total_power_draw\": " ++ show totalDraw ++ ",\n" ++
@@ -144,7 +154,7 @@ state_to_string SpaceshipState{..} =
      "}"
 
 lifeSupportStatusToJson :: ComponentStatus -> String
-lifeSupportStatusToJson Offline = "\"OFFLINE\""
+lifeSupportStatusToJson Offline = "\"OFFLINE\"" -- initial allowed
 lifeSupportStatusToJson OfflinePowerDenied = "\"OFFLINE_POWER_DENIED\""
 lifeSupportStatusToJson _ = "\"ONLINE\""
 
@@ -217,7 +227,7 @@ runSimulationLogic st@SpaceshipState{..} evts =
     -- Phase 3
     allReqs = phase1Reqs ++ coolingReqs
     totalPowerOut = numReactors * 1000
-    
+
     (granted, denied, arbLogs, arbAlerts, updatedComps, coolerGranted) = 
       arbitratePower components allReqs totalPowerOut
 
@@ -232,7 +242,11 @@ runSimulationLogic st@SpaceshipState{..} evts =
     newHeat = max 0 (totalHeat + actualHeatDelta)
     isOverheat = newHeat >= 90.0
 
-    lifeSupportFailed = any (\c -> isLifeSupport (cType c) && cStatus c == OfflinePowerDenied) updatedComps
+    lifeSupportFailed =
+      any (\c -> isLifeSupport (cType c) &&
+                 (cStatus c == OfflinePowerDenied || cStatus c == Offline))
+          updatedComps
+
     isAlive = alive && not isOverheat && not lifeSupportFailed
 
     finalLogs = phase1Logs ++ phase2Logs ++ coolerTransitionLogs ++ arbLogs
@@ -241,10 +255,10 @@ runSimulationLogic st@SpaceshipState{..} evts =
 
     finalState = st 
       { tickCount = tickCount + 1
-      , components = updatedComps
+      , components = if isAlive then updatedComps else components -- freeze components if ship destroyed this tick
       , totalHeat = newHeat
       , alive = isAlive
-      , coolerActive = coolerGranted
+      , coolerActive = coolerGranted && isAlive
       }
   in (finalState, finalLogs, finalAlerts)
 
@@ -281,7 +295,6 @@ generatePhase1Requests comps evts =
 generateCoolingRequests :: [Component] -> Double -> [PowerRequest]
 generateCoolingRequests comps predictedHeat =
   if predictedHeat > 50
-  -- SỬA Ở ĐÂY: Thay cId thành (cId c)
   then [ PowerRequest (cId c) P3 150 "Cooling" | c <- comps, isLifeSupport (cType c) ]
   else []
 
@@ -319,7 +332,18 @@ computeActualHeatDelta numReactors grantedReqs =
 arbitratePower :: [Component] -> [PowerRequest] -> Int 
                -> ([PowerRequest], [PowerRequest], [String], [String], [Component], Bool)
 arbitratePower comps reqs totalPower =
-  let sorted = sortOn prPriority reqs 
+  let -- prioWeight: smaller = higher priority so sortOn ascending places P1 first
+      prioWeight :: Priority -> Int
+      prioWeight P1 = 1
+      prioWeight P2 = 2
+      prioWeight P3 = 3
+      prioWeight P4 = 4
+      prioWeight P5 = 5
+      prioWeight P6 = 6
+
+      -- sort by priority ascending (P1 first)
+      sorted = sortOn (prioWeight . prPriority) reqs
+
       process _ [] granted denied logs alerts compsAcc coolerG = 
         (granted, denied, logs, alerts, compsAcc, coolerG)
       
@@ -337,26 +361,26 @@ arbitratePower comps reqs totalPower =
              in process avail' rs granted' denied logs2 alerts compsAcc' coolerG'
            
            else 
-             let isLifeStd = prKind r == "Standard" && 
+             let -- determine if special alert should be emitted (and thus suppress PowerDenied(...) log)
+                 isLifeStd = prKind r == "Standard" && 
                              any (\c -> cId c == prId r && isLifeSupport (cType c)) compsAcc
                  isShieldEmer = prKind r == "Emergency" && 
-                              any (\c -> cId c == prId r && isShield (cType c)) compsAcc
+                                any (\c -> cId c == prId r && isShield (cType c)) compsAcc
                  isEngineHigh = prKind r == "HighThrust" && 
-                              any (\c -> cId c == prId r && isEngine (cType c)) compsAcc
-                 
-                 (alerts', logs2) = 
+                                any (\c -> cId c == prId r && isEngine (cType c)) compsAcc
+
+                 (alerts', logs2) =
                    if isLifeStd
                    then (alerts ++ ["PowerDenied(LifeSupport)"], logs) 
                    else if isShieldEmer
                    then (alerts ++ ["PowerDenied(Shields)"], logs)      
                    else if isEngineHigh
-                   then (alerts ++ ["EngineThrustFailure"], logs)       
+                   then (alerts ++ ["EngineThrustFailure"], logs)
                    else (alerts, logs1 ++ ["PowerDenied(" ++ prId r ++ ")"])
-                 
+
                  denied' = denied ++ [r]
                  compsAcc' = setComponentOnDenied compsAcc r
              in process avail rs granted denied' logs2 alerts' compsAcc' coolerG
-  
   in process totalPower sorted [] [] [] [] comps False
 
 setComponentOnGrant :: [Component] -> PowerRequest -> [Component]
@@ -364,7 +388,7 @@ setComponentOnGrant cs req = map upd cs
   where
     upd c
       | cId c /= prId req = c
-      | prKind req == "Cooling" = c { cStatus = Online }
+      | prKind req == "Cooling" = c { cStatus = Online } -- cooler toggles life support to ONLINE
       | prKind req == "HighThrust" = c { cStatus = HighThrustActive }
       | prKind req == "Emergency" = c { cStatus = ShieldEmergencyActive }
       | otherwise = c { cStatus = Online }
@@ -373,8 +397,8 @@ setComponentOnDenied :: [Component] -> PowerRequest -> [Component]
 setComponentOnDenied cs req = map upd cs
   where
     upd c
-      | cId c /= prId req = c
-      | prKind req == "Cooling" = c 
+      | cId c /= prId req = c 
+      | prKind req == "Cooling" = c  -- Cooling denied: keep previous state (cooler remains off)
       | otherwise = c { cStatus = OfflinePowerDenied }
 
 -- ==========================
@@ -392,16 +416,22 @@ isSensors Sensors = True; isSensors _ = False
 -- 11. PARSING AND JSON HELPERS
 -- ==========================
 
+-- Parse events JSON array safely using aeson. If parse fails, fall back to substring detection.
 parseEvents :: String -> [ExternalEvent]
-parseEvents s
-  | hasToken "\"ShieldHit\"" s || hasToken "ShieldHit" s = 
-      if hasToken "\"EngineFullThrust\"" s || hasToken "EngineFullThrust" s
-      then [ShieldHit, EngineFullThrust]
-      else [ShieldHit]
-  | hasToken "\"EngineFullThrust\"" s || hasToken "EngineFullThrust" s = [EngineFullThrust]
-  | otherwise = []
-  where
-    hasToken token str = token `isInfixOf` str
+parseEvents s =
+  let shield = "\"ShieldHit\"" `isInfixOf` s || "ShieldHit" `isInfixOf` s
+      thrust = "\"EngineFullThrust\"" `isInfixOf` s || "EngineFullThrust" `isInfixOf` s
+  in case (shield, thrust) of
+       (True, True)   -> [ShieldHit, EngineFullThrust]
+       (True, False)  -> [ShieldHit]
+       (False, True)  -> [EngineFullThrust]
+       _              -> []
+
+mapMaybeStrToEvent :: [String] -> [ExternalEvent]
+mapMaybeStrToEvent = foldr (\x acc -> case x of
+                           "ShieldHit" -> ShieldHit : acc
+                           "EngineFullThrust" -> EngineFullThrust : acc
+                           _ -> acc) []
 
 encodeStringList :: [String] -> String
 encodeStringList list = "[" ++ intercalate ", " (map show list) ++ "]"
@@ -413,7 +443,7 @@ encodeStringList list = "[" ++ intercalate ", " (map show list) ++ "]"
 main :: IO ()
 main = do
     hSetBuffering stdout NoBuffering
-    
+
     -- Initialize default blueprint
     let r1 = Component "Reactor1" Reactor P1 Online
     let ls = Component "LifeSup" LifeSupport P1 Offline
@@ -421,10 +451,10 @@ main = do
     let en = Component "Engine1" Engine P5 Offline
     let br = Component "Bridge1" Bridge P4 Offline
     let sn = Component "Sensors1" Sensors P6 Offline
-    
+
     let myBlueprint = ShipBlueprint "USS Voyager" [r1, ls, sh, en, br, sn]
     let st0 = initial_state myBlueprint
-    
+
     loop st0
 
 loop :: SpaceshipState -> IO ()
@@ -440,14 +470,15 @@ processCommand state cmd
     | cmd == "print_state" = do
         putStrLn (state_to_string state)
         loop state
-        
+
     | "tick " `isPrefixOf` cmd = do
-        let jsonEvents = drop 5 cmd 
+        let jsonEvents = drop 5 cmd
         let (newState, logs, alerts) = tick' state jsonEvents
-        
+
         putStrLn logs
         putStrLn alerts
-        
+        putStrLn (state_to_string newState)
+
         loop newState
-        
+
     | otherwise = loop state
